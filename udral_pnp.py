@@ -6,7 +6,7 @@ from typing import Optional, Callable, Sequence, Tuple, AbstractSet, Type, TypeV
 try:
     from pprint import pformat
 except ImportError:
-    pformat = str
+    pformat = str  # type: ignore
 import random
 import logging
 import asyncio
@@ -29,7 +29,6 @@ from service_detector import PortSuffixMapping, detect_service_instances
 
 PORT_ID_UNSET = 0xFFFF
 
-
 MessageClass = TypeVar("MessageClass", bound=pyuavcan.dsdl.CompositeObject)
 ServiceClass = TypeVar("ServiceClass", bound=pyuavcan.dsdl.ServiceObject)
 
@@ -44,9 +43,10 @@ class AirspeedClient:
         :raises: :class:`pyuavcan.application.PortNotConfiguredError` if a mandatory port is not configured.
         """
         self._node = local_node
+        self._prefix = prefix
 
         self._sub_dp = self._node.make_subscriber(uavcan.si.sample.pressure.Scalar_1_0, f"{prefix}.diff_pressure")
-        self._sub_dp.receive_in_background(lambda msg, _trans: print("Airspeed", prefix, msg))
+        self._sub_dp.receive_in_background(self._on_diff_pressure)
 
         # Suppose that the temperature subject is optional: if not configured, simply ignore it.
         try:
@@ -54,9 +54,19 @@ class AirspeedClient:
                 uavcan.si.sample.temperature.Scalar_1_0,
                 f"{prefix}.temperature",
             )
-            self._sub_temp.receive_in_background(lambda msg, _trans: print("Airspeed", prefix, msg))
+            self._sub_temp.receive_in_background(self._on_temperature)
         except pyuavcan.application.PortNotConfiguredError:
             self._sub_temp = None
+
+    async def _on_diff_pressure(self,
+                                msg: uavcan.si.sample.pressure.Scalar_1_0,
+                                meta: pyuavcan.transport.TransferFrom) -> None:
+        print("Airspeed", self._prefix, msg, meta)
+
+    async def _on_temperature(self,
+                              msg: uavcan.si.sample.temperature.Scalar_1_0,
+                              meta: pyuavcan.transport.TransferFrom) -> None:
+        print("Airspeed", self._prefix, msg, meta)
 
     @staticmethod
     def instantiate_if_enabled(local_node: pyuavcan.application.Node, prefix: str) -> Optional[AirspeedClient]:
@@ -65,6 +75,9 @@ class AirspeedClient:
         except pyuavcan.application.PortNotConfiguredError:
             return None
 
+    def __repr__(self) -> str:
+        return pyuavcan.util.repr_attributes(self, diff_pressure=self._sub_dp, temperature=self._sub_temp)
+
 
 class ServoClient:
     def __init__(self, local_node: pyuavcan.application.Node, prefix: str) -> None:
@@ -72,9 +85,10 @@ class ServoClient:
         :raises: :class:`pyuavcan.application.PortNotConfiguredError` if a mandatory port is not configured.
         """
         self._node = local_node
+        self._prefix = prefix
 
         self._sub_dn = self._node.make_subscriber(zubax.physics.dynamics.translation.LinearTs_0_1, f"{prefix}.dynamics")
-        self._sub_dn.receive_in_background(lambda msg, _trans: print("Servo", prefix, msg))
+        self._sub_dn.receive_in_background(self._on_dynamics)
 
         self._pub_sp = self._node.make_publisher(zubax.physics.dynamics.translation.Linear_0_1, f"{prefix}.setpoint")
         self._pub_sp.priority = pyuavcan.transport.Priority.HIGH
@@ -88,12 +102,20 @@ class ServoClient:
         msg.force.newton                                        = force
         self._pub_sp.publish_soon(msg)
 
+    async def _on_dynamics(self,
+                           msg: zubax.physics.dynamics.translation.Linear_0_1,
+                           meta: pyuavcan.transport.TransferFrom) -> None:
+        print("Servo", self._prefix, msg, meta)
+
     @staticmethod
     def instantiate_if_enabled(local_node: pyuavcan.application.Node, prefix: str) -> Optional[ServoClient]:
         try:
             return ServoClient(local_node, prefix)
         except pyuavcan.application.PortNotConfiguredError:
             return None
+
+    def __repr__(self) -> str:
+        return pyuavcan.util.repr_attributes(self, dynamics=self._sub_dn, setpoint=self._pub_sp)
 
 
 async def main() -> None:
@@ -108,7 +130,7 @@ async def main() -> None:
 
         # Application logic -- here we instantiate service client endpoints.
         airspeed = [
-            AirspeedClient.instantiate_if_enabled(node, f"airspeed.{i}") for i in range(2)
+            AirspeedClient.instantiate_if_enabled(node, f"airspd.{i}") for i in range(2)
         ]
         servo = [
             ServoClient.instantiate_if_enabled(node, f"servo.{i}") for i in range(3)
@@ -116,15 +138,63 @@ async def main() -> None:
 
         def allocate_services(remote_node_id: int, ports: PortAssignment) -> PortAssignment:
             logging.info("Allocating services of remote node %d; available ports: %s", remote_node_id, ports)
-            services = detect_service_instances(
-                pub=ports.pub,
-                sub=ports.sub,
-                cln=ports.cln,
-                srv=ports.srv,
-            )
+            services = detect_service_instances(pub=ports.pub,
+                                                sub=ports.sub,
+                                                cln=ports.cln,
+                                                srv=ports.srv)
             logging.info("Detected services on node %d:\n%s", remote_node_id, pformat(services))
-            # TODO: perform allocation
-            return PortAssignment()
+            final = PortAssignment()
+
+            # Allocate airspeed services if provided by the node.
+            for instance_name, psm in services.get("airspeed", {}).items():
+                if "differential_pressure" not in psm.pub:
+                    logging.warning("Differential pressure subject not found in %r %r", instance_name, psm)
+                    continue
+                try:
+                    free_index = airspeed.index(None)
+                except ValueError:
+                    logging.warning("Cannot allocate airspeed service %r %r because no free slots are available",
+                                    instance_name, psm)
+                    break
+                # FIXME There is a bunch of leaky logic here: we rely on the same subject names here and in the client.
+                id_diff_pres = 6010 + free_index
+                id_temp      = 6020 + free_index
+                prefix = f"airspd.{free_index}"
+                node.registry[f"uavcan.sub.{prefix}.diff_pressure.id"] = id_diff_pres
+                final.pub[psm.pub["differential_pressure"]]            = id_diff_pres
+                if "static_air_temperature" in psm.pub:
+                    node.registry[f"uavcan.sub.{prefix}.temperature.id"] = id_temp
+                    final.pub[psm.pub["static_air_temperature"]]         = id_temp
+                airspeed[free_index] = AirspeedClient(node, prefix)
+                logging.warning("New airspeed client of node %d: %r", remote_node_id, airspeed[free_index])
+
+            # Allocate servo services if provided by the node.
+            for instance_name, psm in services.get("servo", {}).items():
+                if "dynamics" not in psm.pub:
+                    logging.warning("Dynamics subject not found in %r %r", instance_name, psm)
+                    continue
+                if "setpoint" not in psm.sub:  # "sub" because servos subscribe to setpoint
+                    logging.warning("Setpoint subject not found in %r %r", instance_name, psm)
+                    continue
+                try:
+                    free_index = servo.index(None)
+                except ValueError:
+                    logging.warning("Cannot allocate servo service %r %r because no free slots are available",
+                                    instance_name, psm)
+                    break
+                # FIXME There is a bunch of leaky logic here: we rely on the same subject names here and in the client.
+                id_dynamics = 5000 + free_index
+                id_setpoint = 5050 + free_index
+                prefix = f"servo.{free_index}"
+                # Mind the difference between pub/sub: we subscribe to dynamics and publish the setpoint!
+                node.registry[f"uavcan.sub.{prefix}.dynamics.id"] = id_dynamics
+                node.registry[f"uavcan.pub.{prefix}.setpoint.id"] = id_setpoint
+                final.pub[psm.pub["dynamics"]]                    = id_dynamics
+                final.pub[psm.sub["setpoint"]]                    = id_setpoint
+                servo[free_index] = ServoClient(node, prefix)
+                logging.warning("New servo client of node %d: %r", remote_node_id, airspeed[free_index])
+
+            return final
 
         def on_node_status_change(remote_node_id: int,
                                   _: Optional[node_tracker.Entry],
@@ -149,7 +219,7 @@ async def main() -> None:
         trk.add_update_handler(on_node_status_change)
 
         while True:
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.5)
             for k in list(alloc_tasks):
                 t = alloc_tasks[k]
                 if t.done():
@@ -158,6 +228,9 @@ async def main() -> None:
                     except Exception as ex:
                         logging.exception("Allocation task for node %d failed (will retry next time): %s", k, ex)
                     del alloc_tasks[k]
+            for s in servo:
+                if s:
+                    s.send_setpoint(position=random.random(), velocity=10.0, acceleration=1.0, force=float("nan"))
 
 
 if __name__ == "__main__":
