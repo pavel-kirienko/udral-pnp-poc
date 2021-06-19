@@ -28,10 +28,13 @@ class PortAssignment:
     srv: dict[str, int] = dataclasses.field(default_factory=dict)
 
 
+ServiceAllocator = Callable[[int, PortAssignment], PortAssignment]
+
+
 async def perform_automatic_port_id_allocation(local_node: pyuavcan.application.Node,
                                                remote_node_id: int,
                                                expected_pnp_cookie: str,
-                                               service_allocator: Callable[[PortAssignment], PortAssignment]) -> None:
+                                               service_allocator: ServiceAllocator) -> None:
     """
     This function implements the interaction strategy with the remote node that may require auto-configuration.
     It is lengthy but actually very simple:
@@ -67,9 +70,9 @@ async def perform_automatic_port_id_allocation(local_node: pyuavcan.application.
         return
     cookie = value.string.value.tobytes().decode().strip().lower()
     if cookie == expected_pnp_cookie:
-        _logger.info("Node %d is already configured for use in this network", remote_node_id)
+        _logger.info("Node %d is already configured for use in this network; cookie: %r", remote_node_id, cookie)
         return
-    if cookie == "reject":
+    if cookie and not cookie.startswith("autoconfigured"):
         _logger.info("Node %d is manually configured, skipping auto-configuration", remote_node_id)
         return
     _logger.info("Node %d requires autoconfiguration because cookie %r != expected %r",
@@ -96,13 +99,14 @@ async def perform_automatic_port_id_allocation(local_node: pyuavcan.application.
     # https://github.com/UAVCAN/public_regulated_data_types/blob/master/uavcan/register/384.Access.1.0.uavcan
     def extract_ports(kind: str) -> list[str]:
         s, e = f"uavcan.{kind}.", ".id"
-        return [r[len(s) - 1 : -len(e)] for r in available_registers if r.startswith(s) and r.endswith(e)]
+        return [r[len(s) : -len(e)] for r in available_registers if r.startswith(s) and r.endswith(e)]
 
     pub, sub, cln, srv = map(extract_ports, ("pub", "sub", "cln", "srv"))
 
     # Query the ID of each port from the node.
     async def read_port_id(kind: str, port_name: str) -> int:
         name = f"uavcan.{kind}.{port_name}.id"
+        _logger.debug("Node %d: reading port-ID register %r", remote_node_id, name)
         value = await access(name)
         return int(register.ValueProxy(value))  # This form will accept any numeric value, not just natural16.
 
@@ -115,7 +119,7 @@ async def perform_automatic_port_id_allocation(local_node: pyuavcan.application.
     _logger.info("Node %d: currently configured ports: %s", remote_node_id, original_ports)
 
     # Update the local configuration and obtain the new remote configuration to match the local one.
-    new_ports = service_allocator(original_ports)
+    new_ports = service_allocator(remote_node_id, original_ports)
     _logger.info("Node %d: new ports: %s", remote_node_id, new_ports)
     assert isinstance(new_ports, PortAssignment)
 
@@ -152,7 +156,7 @@ async def perform_automatic_port_id_allocation(local_node: pyuavcan.application.
             _logger.warning("Node %d did not respond to %r", remote_node_id, request)
         else:
             response, _ = response_transfer
-            _logger.info("Node %d: command %r response: %r", request, response)
+            _logger.info("Node %d: command %r response: %r", remote_node_id, request, response)
 
     await try_command(uavcan.node.ExecuteCommand_1_1.Request.COMMAND_STORE_PERSISTENT_STATES)
     await try_command(uavcan.node.ExecuteCommand_1_1.Request.COMMAND_RESTART)

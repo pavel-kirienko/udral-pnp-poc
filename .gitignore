@@ -79,3 +79,6 @@ dmypy.json
 /uavcan/
 /reg/
 /zubax*/
+
+# Runtime data
+*.db
