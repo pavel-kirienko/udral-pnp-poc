@@ -2,7 +2,7 @@
 # Pavel Kirienko <pavel@uavcan.org>
 
 from __future__ import annotations
-from typing import Optional, Callable, Sequence, Tuple, AbstractSet, Type, TypeVar
+from typing import Optional, TypeVar
 try:
     from pprint import pformat
 except ImportError:
@@ -24,17 +24,13 @@ import uavcan.si.sample.pressure
 import zubax.physics.dynamics.translation
 
 from node_proxy import PortAssignment, perform_automatic_port_id_allocation
-from service_detector import PortSuffixMapping, detect_service_instances
+from service_discoverer import discover_service_instances
 
 
 PORT_ID_UNSET = 0xFFFF
 
 MessageClass = TypeVar("MessageClass", bound=pyuavcan.dsdl.CompositeObject)
 ServiceClass = TypeVar("ServiceClass", bound=pyuavcan.dsdl.ServiceObject)
-
-
-def match_port_assignment(source: PortAssignment) -> PortAssignment:
-    pass
 
 
 class AirspeedClient:
@@ -136,17 +132,20 @@ async def main() -> None:
             ServoClient.instantiate_if_enabled(node, f"servo.{i}") for i in range(3)
         ]
 
-        def allocate_services(remote_node_id: int, ports: PortAssignment) -> PortAssignment:
+        def allocate_services(remote_node_id: int,
+                              service_instance_prefixes: dict[str, list[str]],
+                              ports: PortAssignment) -> PortAssignment:
             logging.info("Allocating services of remote node %d; available ports: %s", remote_node_id, ports)
-            services = detect_service_instances(pub=ports.pub,
-                                                sub=ports.sub,
-                                                cln=ports.cln,
-                                                srv=ports.srv)
-            logging.info("Detected services on node %d:\n%s", remote_node_id, pformat(services))
+            services = discover_service_instances(service_instance_prefixes,
+                                                  pub=ports.pub,
+                                                  sub=ports.sub,
+                                                  cln=ports.cln,
+                                                  srv=ports.srv)
+            logging.info("Discovered services on node %d:\n%s", remote_node_id, pformat(services))
             final = PortAssignment()
 
             # Allocate airspeed services if provided by the node.
-            for instance_name, psm in services.get("airspeed", {}).items():
+            for instance_name, psm in services.get("reg.udral.service.pitot", {}).items():
                 if "differential_pressure" not in psm.pub:
                     logging.warning("Differential pressure subject not found in %r %r", instance_name, psm)
                     continue
@@ -169,7 +168,7 @@ async def main() -> None:
                 logging.warning("New airspeed client of node %d: %r", remote_node_id, airspeed[free_index])
 
             # Allocate servo services if provided by the node.
-            for instance_name, psm in services.get("servo", {}).items():
+            for instance_name, psm in services.get("reg.udral.service.actuator.servo", {}).items():
                 if "dynamics" not in psm.pub:
                     logging.warning("Dynamics subject not found in %r %r", instance_name, psm)
                     continue
@@ -190,7 +189,7 @@ async def main() -> None:
                 node.registry[f"uavcan.sub.{prefix}.dynamics.id"] = id_dynamics
                 node.registry[f"uavcan.pub.{prefix}.setpoint.id"] = id_setpoint
                 final.pub[psm.pub["dynamics"]]                    = id_dynamics
-                final.pub[psm.sub["setpoint"]]                    = id_setpoint
+                final.sub[psm.sub["setpoint"]]                    = id_setpoint
                 servo[free_index] = ServoClient(node, prefix)
                 logging.warning("New servo client of node %d: %r", remote_node_id, airspeed[free_index])
 

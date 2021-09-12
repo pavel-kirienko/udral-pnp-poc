@@ -24,4 +24,4 @@ export UAVCAN__NODE__ID=1
 Afterward you can omit the environment variables because the configuration is stored in the "*.db" file.
 
 Then run the script: `./udral_pnp.py`.
-You can use these demos to test the script: https://github.com/UAVCAN/demos/tree/udral-demo
+You can use these demos to test the script: https://github.com/UAVCAN/demos

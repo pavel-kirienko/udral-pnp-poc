@@ -28,7 +28,15 @@ class PortAssignment:
     srv: dict[str, int] = dataclasses.field(default_factory=dict)
 
 
-ServiceAllocator = Callable[[int, PortAssignment], PortAssignment]
+ServiceAllocator = Callable[[int, dict[str, list[str]], PortAssignment], PortAssignment]
+"""
+Arguments:
+
+- Node-ID.
+- Service instance prefix mapping ``service_name --> [prefix]``;
+  e.g., ``{"reg.udral.service.actuator.servo": ["left", "right"]}``.
+- The current port assignment.
+"""
 
 
 async def perform_automatic_port_id_allocation(local_node: pyuavcan.application.Node,
@@ -95,6 +103,18 @@ async def perform_automatic_port_id_allocation(local_node: pyuavcan.application.
         available_registers.append(nm)
     _logger.info("Registers available on node %d: %r", remote_node_id, available_registers)
 
+    # Next, see if there are any service discovery registers, read their values.
+    # E.g., a string "left right" stored in register "reg.udral.service.actuator.servo" means that ports whose
+    # names start with "left" and "right" implement the servo network service.
+    service_instance_prefixes: dict[str, list[str]] = {}
+    for rn in available_registers:
+        if rn.startswith("reg."):
+            # Ignore non-string-typed registers as they must be intended for other purpose.
+            if (val := await access(rn)).string is not None:
+                assert val.string is not None
+                service_instance_prefixes[rn] = [x.strip(".") for x in val.string.value.tobytes().decode().split()]
+    _logger.info("Node %d: service instance prefixes: %s", remote_node_id, service_instance_prefixes)
+
     # Detect which ports are available based on the standard registers. See UAVCAN docs:
     # https://github.com/UAVCAN/public_regulated_data_types/blob/master/uavcan/register/384.Access.1.0.uavcan
     def extract_ports(kind: str) -> list[str]:
@@ -119,7 +139,7 @@ async def perform_automatic_port_id_allocation(local_node: pyuavcan.application.
     _logger.info("Node %d: currently configured ports: %s", remote_node_id, original_ports)
 
     # Update the local configuration and obtain the new remote configuration to match the local one.
-    new_ports = service_allocator(remote_node_id, original_ports)
+    new_ports = service_allocator(remote_node_id, service_instance_prefixes, original_ports)
     _logger.info("Node %d: new ports: %s", remote_node_id, new_ports)
     assert isinstance(new_ports, PortAssignment)
 
